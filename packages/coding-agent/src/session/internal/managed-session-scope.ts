@@ -1094,6 +1094,202 @@ function receiptMatches(
 	}
 }
 
+function plannedDetachedArtifactPath(sourcePath: string, operation: string): string {
+	return path.join(path.dirname(sourcePath), `.gjc-migrate-${operation}-artifacts`);
+}
+
+type ParsedReceiptArtifactIdentity = {
+	dev: bigint;
+	ino: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+};
+
+function artifactDirectoryIdentityFromTree(
+	tree: NativeDirectoryTreeSnapshot,
+): ParsedReceiptArtifactIdentity | undefined {
+	const root = tree.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
+	if (!root) return undefined;
+	const rootDev = parseDecimalString(tree.rootDev);
+	const rootIno = parseDecimalString(tree.rootIno);
+	const dev = parseDecimalString(root.dev);
+	const ino = parseDecimalString(root.ino);
+	const size = parseDecimalString(root.size);
+	const mtimeNs = parseDecimalString(root.mtimeNs);
+	if (
+		rootDev === undefined ||
+		rootIno === undefined ||
+		dev === undefined ||
+		ino === undefined ||
+		size === undefined ||
+		mtimeNs === undefined ||
+		rootDev !== dev ||
+		rootIno !== ino
+	)
+		return undefined;
+	return { dev, ino, size, mtimeNs };
+}
+
+function sameArtifactIdentity(
+	left: ParsedReceiptArtifactIdentity | undefined,
+	right: ParsedReceiptArtifactIdentity | undefined,
+): boolean {
+	return (
+		!!left &&
+		!!right &&
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs
+	);
+}
+
+function sameNativeDirectoryTree(
+	left: NativeDirectoryTreeSnapshot,
+	right: NativeDirectoryTreeSnapshot,
+	ignoreRootCtime = false,
+): boolean {
+	return (
+		left.rootDev === right.rootDev &&
+		left.rootIno === right.rootIno &&
+		left.entries.length === right.entries.length &&
+		left.entries.every((entry, index) => {
+			const other = right.entries[index];
+			return (
+				other !== undefined &&
+				entry.relativePath === other.relativePath &&
+				entry.kind === other.kind &&
+				entry.dev === other.dev &&
+				entry.ino === other.ino &&
+				entry.size === other.size &&
+				entry.mtimeNs === other.mtimeNs &&
+				(ignoreRootCtime && entry.relativePath === "" ? true : entry.ctimeNs === other.ctimeNs) &&
+				entry.sha256 === other.sha256
+			);
+		})
+	);
+}
+
+type ParsedPreparedArtifactReceipt = {
+	attemptId: string;
+	sourceArtifactQuarantine?: {
+		path: string;
+		detachedPath: string;
+		identity: ParsedReceiptArtifactIdentity;
+		tree: NativeDirectoryTreeSnapshot;
+	};
+};
+function parsePreparedArtifactQuarantine(
+	record: unknown,
+	source: ManagedCandidate,
+	operation: string,
+): ParsedPreparedArtifactReceipt["sourceArtifactQuarantine"] {
+	if (record === undefined) return undefined;
+	if (!record || typeof record !== "object") throw new Error("durability_failed");
+	const value = record as {
+		path?: unknown;
+		detachedPath?: unknown;
+		identity?: unknown;
+		tree?: unknown;
+	};
+	const expectedPath = source.path.slice(0, -6);
+	const expectedDetachedPath = plannedDetachedArtifactPath(source.path, operation);
+	const identityRecord = value.identity as Record<string, unknown> | undefined;
+	const dev = typeof identityRecord?.dev === "string" ? parseDecimalString(identityRecord.dev) : undefined;
+	const ino = typeof identityRecord?.ino === "string" ? parseDecimalString(identityRecord.ino) : undefined;
+	const size = typeof identityRecord?.size === "string" ? parseDecimalString(identityRecord.size) : undefined;
+	const mtimeNs = typeof identityRecord?.mtimeNs === "string" ? parseDecimalString(identityRecord.mtimeNs) : undefined;
+	const tree = artifactTreeSnapshot(value.tree);
+	if (
+		typeof value.path !== "string" ||
+		value.path !== expectedPath ||
+		typeof value.detachedPath !== "string" ||
+		value.detachedPath !== expectedDetachedPath ||
+		dev === undefined ||
+		ino === undefined ||
+		size === undefined ||
+		mtimeNs === undefined ||
+		!tree
+	)
+		throw new Error("durability_failed");
+	const identity: ParsedReceiptArtifactIdentity = { dev, ino, size, mtimeNs };
+	const parsedTreeIdentity = artifactDirectoryIdentityFromTree(tree);
+	if (!sameArtifactIdentity(identity, parsedTreeIdentity)) throw new Error("durability_failed");
+	return { path: value.path, detachedPath: value.detachedPath, identity, tree };
+}
+function parsePreparedArtifactReceipt(
+	receiptPath: string,
+	scope: ManagedScope,
+	source: ManagedCandidate,
+	destination: { path: string; sessionId: string; cwd: string },
+): ParsedPreparedArtifactReceipt {
+	const record = JSON.parse(captureManagedFileNoFollow(receiptPath).bytes.toString("utf8"));
+	if (!record || typeof record !== "object") throw new Error("durability_failed");
+	const value = record as {
+		schemaVersion?: unknown;
+		state?: unknown;
+		policy?: unknown;
+		scope?: unknown;
+		attemptId?: unknown;
+		source?: unknown;
+		destination?: unknown;
+		artifactManifest?: unknown;
+		sourceArtifactQuarantine?: unknown;
+	};
+	if (
+		value.schemaVersion !== 2 ||
+		value.state !== "prepared" ||
+		value.policy !== "copy-retain" ||
+		value.scope !== scopeDigest(scope.platform, scope.canonicalCwd) ||
+		typeof value.attemptId !== "string" ||
+		value.attemptId.length === 0 ||
+		!Array.isArray(value.artifactManifest) ||
+		value.artifactManifest.length !== 0
+	) {
+		throw new Error("durability_failed");
+	}
+	const sourceRecord = value.source as Record<string, unknown> | undefined;
+	const destinationRecord = value.destination as Record<string, unknown> | undefined;
+	const sourceHeader = sourceRecord?.header as Record<string, unknown> | undefined;
+	const destinationHeader = destinationRecord?.header as Record<string, unknown> | undefined;
+	const sourceIdentity = sourceRecord?.identity as Record<string, unknown> | undefined;
+	const operation = stableOperationName(source);
+	if (
+		!sourceRecord ||
+		typeof sourceRecord.path !== "string" ||
+		sourceRecord.path !== source.path ||
+		sourceRecord.sessionId !== source.sessionId ||
+		sourceRecord.sha256 !== source.identity.sha256 ||
+		!sourceHeader ||
+		typeof sourceHeader.id !== "string" ||
+		sourceHeader.id !== source.sessionId ||
+		typeof sourceHeader.cwd !== "string" ||
+		sourceHeader.cwd !== source.cwd ||
+		!sourceIdentity ||
+		sourceIdentity.dev !== String(source.identity.dev) ||
+		sourceIdentity.ino !== String(source.identity.ino) ||
+		sourceIdentity.size !== source.identity.size ||
+		sourceIdentity.mtimeNs !== String(source.identity.mtimeNs)
+	) {
+		throw new Error("durability_failed");
+	}
+	if (
+		!destinationRecord ||
+		typeof destinationRecord.path !== "string" ||
+		destinationRecord.path !== destination.path ||
+		destinationRecord.sessionId !== destination.sessionId ||
+		!destinationHeader ||
+		typeof destinationHeader.id !== "string" ||
+		destinationHeader.id !== destination.sessionId ||
+		destinationHeader.cwd !== destination.cwd
+	) {
+		throw new Error("durability_failed");
+	}
+	return {
+		attemptId: value.attemptId,
+		sourceArtifactQuarantine: parsePreparedArtifactQuarantine(value.sourceArtifactQuarantine, source, operation),
+	};
+}
 function preparedReceiptMatches(
 	receiptPath: string,
 	scope: ManagedScope,
@@ -1102,44 +1298,17 @@ function preparedReceiptMatches(
 	artifactPlan: DetachedArtifactRoot | undefined,
 ): boolean {
 	try {
-		const record = JSON.parse(captureManagedFileNoFollow(receiptPath).bytes.toString("utf8")) as Record<
-			string,
-			unknown
-		>;
-		const recordedSource = record.source as Record<string, unknown> | undefined;
-		const recordedDestination = record.destination as Record<string, unknown> | undefined;
-		const quarantine = record.sourceArtifactQuarantine as Record<string, unknown> | undefined;
-		const identity = quarantine?.identity as Record<string, unknown> | undefined;
-		return (
-			record.schemaVersion === 2 &&
-			record.state === "prepared" &&
-			record.policy === "copy-retain" &&
-			record.scope === scopeDigest(scope.platform, scope.canonicalCwd) &&
-			Array.isArray(record.artifactManifest) &&
-			record.artifactManifest.length === 0 &&
-			recordedSource?.path === source.path &&
-			recordedSource.sessionId === source.sessionId &&
-			recordedSource.sha256 === source.identity.sha256 &&
-			(recordedSource.identity as Record<string, unknown> | undefined)?.dev === String(source.identity.dev) &&
-			(recordedSource.identity as Record<string, unknown> | undefined)?.ino === String(source.identity.ino) &&
-			(recordedSource.identity as Record<string, unknown> | undefined)?.size === source.identity.size &&
-			(recordedSource.identity as Record<string, unknown> | undefined)?.mtimeNs ===
-				String(source.identity.mtimeNs) &&
-			recordedDestination?.path === destination.path &&
-			recordedDestination.sessionId === destination.sessionId &&
-			recordedDestination.header instanceof Object &&
-			(recordedDestination.header as Record<string, unknown>).id === destination.sessionId &&
-			(recordedDestination.header as Record<string, unknown>).cwd === destination.cwd &&
-			(artifactPlan
-				? quarantine?.path === artifactPlan.originalPath &&
+		const parsed = parsePreparedArtifactReceipt(receiptPath, scope, source, destination);
+		const quarantine = parsed.sourceArtifactQuarantine;
+		return artifactPlan
+			? !!(
+					quarantine &&
+					quarantine.path === artifactPlan.originalPath &&
 					quarantine.detachedPath === artifactPlan.detachedPath &&
-					identity?.dev === String(artifactPlan.identity.dev) &&
-					identity.ino === String(artifactPlan.identity.ino) &&
-					identity.size === String(artifactPlan.identity.size) &&
-					identity.mtimeNs === String(artifactPlan.identity.mtimeNs) &&
-					JSON.stringify(artifactTreeSnapshot(quarantine.tree)) === JSON.stringify(artifactPlan.tree)
-				: quarantine === undefined)
-		);
+					sameArtifactIdentity(quarantine.identity, artifactPlan.identity) &&
+					(process.platform !== "win32" || sameNativeDirectoryTree(quarantine.tree, artifactPlan.tree))
+				)
+			: !quarantine;
 	} catch {
 		return false;
 	}
@@ -1405,31 +1574,52 @@ function artifactIdentityAt(pathname: string): SessionStorageFileIdentity | unde
 	}
 }
 
+const DECIMAL_PATTERN = /^\d+$/;
+const parseDecimalString = (value: unknown): bigint | undefined => {
+	if (typeof value !== "string" || !DECIMAL_PATTERN.test(value)) return;
+	return BigInt(value);
+};
+
+const isSafeRelativePath = (relativePath: string): boolean =>
+	!path.isAbsolute(relativePath) && !relativePath.split(/[\\/]/).includes("..");
+
 function artifactTreeSnapshot(value: unknown): NativeDirectoryTreeSnapshot | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const snapshot = value as Record<string, unknown>;
-	if (typeof snapshot.rootDev !== "string" || typeof snapshot.rootIno !== "string" || !Array.isArray(snapshot.entries))
-		return undefined;
 	if (
-		snapshot.entries.length === 0 ||
-		!snapshot.entries.every(entry => {
-			if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
-			const item = entry as Record<string, unknown>;
-			return (
-				typeof item.relativePath === "string" &&
-				!path.isAbsolute(item.relativePath) &&
-				!item.relativePath.split(/[\\/]/).includes("..") &&
-				(item.kind === "file" || item.kind === "directory") &&
-				typeof item.dev === "string" &&
-				typeof item.ino === "string" &&
-				typeof item.size === "string" &&
-				typeof item.mtimeNs === "string" &&
-				typeof item.ctimeNs === "string" &&
-				(item.sha256 === undefined || typeof item.sha256 === "string")
-			);
-		})
+		parseDecimalString(snapshot.rootDev) === undefined ||
+		parseDecimalString(snapshot.rootIno) === undefined ||
+		!Array.isArray(snapshot.entries)
 	)
 		return undefined;
+	const entries = snapshot.entries as Array<Record<string, unknown>>;
+	if (entries.length === 0) return undefined;
+	const seen = new Set<string>();
+	let rootCount = 0;
+	for (const entry of entries) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+		if (typeof entry.relativePath !== "string" || !isSafeRelativePath(entry.relativePath)) return undefined;
+		const relativePath = entry.relativePath;
+		if (seen.has(relativePath)) return undefined;
+		seen.add(relativePath);
+		if (entry.kind !== "file" && entry.kind !== "directory") return undefined;
+		if (relativePath === "") {
+			if (entry.kind !== "directory") return undefined;
+			rootCount++;
+		}
+		if (
+			parseDecimalString(entry.dev) === undefined ||
+			parseDecimalString(entry.ino) === undefined ||
+			parseDecimalString(entry.size) === undefined ||
+			parseDecimalString(entry.mtimeNs) === undefined ||
+			parseDecimalString(entry.ctimeNs) === undefined
+		) {
+			return undefined;
+		}
+		if (entry.kind === "file" && typeof entry.sha256 !== "undefined" && typeof entry.sha256 !== "string")
+			return undefined;
+	}
+	if (rootCount !== 1) return undefined;
 	return snapshot as unknown as NativeDirectoryTreeSnapshot;
 }
 
@@ -1837,15 +2027,16 @@ function planArtifactRootForMigration(sourceTranscript: string, operation: strin
 	}
 	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe_artifacts");
 	const tree = snapshotArtifactTree(originalPath);
-	const root = tree.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
-	if (!root) throw new Error("unsafe_artifacts");
+	const identity = artifactDirectoryIdentityFromTree(tree);
+	if (!identity || identity.dev !== stat.dev || identity.ino !== stat.ino || identity.mtimeNs !== stat.mtimeNs)
+		throw new Error("unsafe_artifacts");
 	return {
 		originalPath,
 		detachedPath: path.join(path.dirname(originalPath), `.gjc-migrate-${operation}-artifacts`),
 		identity: {
 			dev: stat.dev,
 			ino: stat.ino,
-			size: process.platform === "win32" ? BigInt(root.size) : stat.size,
+			size: process.platform === "win32" ? identity.size : stat.size,
 			mtimeNs: stat.mtimeNs,
 		},
 		tree,
@@ -1868,25 +2059,71 @@ function sameDirectoryObject(leftPath: string, rightPath: string): boolean {
 		return false;
 	}
 }
-
-function matchesDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoot): boolean {
+function artifactRootExistsNoFollow(pathname: string): boolean {
 	try {
-		const stat = fs.lstatSync(pathname, { bigint: true });
-		return (
-			stat.isDirectory() &&
-			!stat.isSymbolicLink() &&
-			stat.dev === plan.identity.dev &&
-			stat.ino === plan.identity.ino &&
-			stat.size === plan.identity.size &&
-			stat.mtimeNs === plan.identity.mtimeNs &&
-			sameDirectoryObject(path.dirname(pathname), path.dirname(plan.detachedPath))
-		);
-	} catch {
-		return false;
+		const stat = fs.lstatSync(pathname);
+		if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("unsafe_artifacts");
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
 	}
 }
 
-function detachArtifactRootForMigration(plan: DetachedArtifactRoot): DetachedArtifactRoot {
+function assertDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoot, requireTree: boolean): void {
+	let observed: fs.BigIntStats;
+	try {
+		observed = fs.lstatSync(pathname, { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("durability_failed");
+		throw error;
+	}
+	if (!observed.isDirectory() || observed.isSymbolicLink()) throw new Error("unsafe_artifacts");
+	if (
+		observed.dev !== plan.identity.dev ||
+		observed.ino !== plan.identity.ino ||
+		observed.mtimeNs !== plan.identity.mtimeNs ||
+		(process.platform !== "win32" && observed.size !== plan.identity.size)
+	) {
+		throw new Error("durability_failed");
+	}
+	const expectedParent = path.dirname(plan.detachedPath);
+	if (!sameDirectoryObject(path.dirname(pathname), expectedParent)) throw new Error("durability_failed");
+	const treePath =
+		process.platform === "win32" && artifactRootExistsNoFollow(plan.detachedPath) ? plan.detachedPath : pathname;
+	if (
+		process.platform === "win32" &&
+		(!sameDirectoryObject(pathname, treePath) || !sameDirectoryObject(path.dirname(treePath), expectedParent))
+	) {
+		throw new Error("durability_failed");
+	}
+	if (!requireTree) return;
+	const observedTree = snapshotArtifactTree(treePath);
+	const observedIdentity = artifactDirectoryIdentityFromTree(observedTree);
+	if (!sameArtifactIdentity(observedIdentity, plan.identity) || !sameNativeDirectoryTree(observedTree, plan.tree))
+		throw new Error("durability_failed");
+}
+function assertRestoredArtifactRoot(pathname: string, plan: DetachedArtifactRoot): void {
+	assertDetachedArtifactRoot(pathname, plan, false);
+	const observedTree = snapshotArtifactTree(pathname);
+	const observedIdentity = artifactDirectoryIdentityFromTree(observedTree);
+	if (
+		!sameArtifactIdentity(observedIdentity, plan.identity) ||
+		!sameNativeDirectoryTree(observedTree, plan.tree, process.platform !== "win32")
+	)
+		throw new Error("durability_failed");
+}
+
+function matchesDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoot): boolean {
+	assertDetachedArtifactRoot(pathname, plan, process.platform === "win32");
+	return true;
+}
+
+function detachArtifactRootForMigration(
+	plan: DetachedArtifactRoot,
+	assertPublicationConsent?: () => void,
+): DetachedArtifactRoot {
+	assertPublicationConsent?.();
 	const result = native.exactUnlink(plan.originalPath, {
 		...plan.identity,
 		directory: true,
@@ -1895,82 +2132,77 @@ function detachArtifactRootForMigration(plan: DetachedArtifactRoot): DetachedArt
 	});
 	if (!result.ok || !result.detachedPath || !matchesDetachedArtifactRoot(result.detachedPath, plan))
 		throw new Error("durability_failed");
-	const detachedPath =
-		process.platform === "win32" ? fs.realpathSync.native(result.detachedPath) : result.detachedPath;
-	if (!matchesDetachedArtifactRoot(detachedPath, plan)) throw new Error("durability_failed");
-	return { ...plan, detachedPath };
+	assertPublicationConsent?.();
+	if (!matchesDetachedArtifactRoot(plan.detachedPath, plan)) throw new Error("durability_failed");
+	return plan;
 }
 
-function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandidate): void {
+function restorePreparedArtifactRoot(
+	scope: ManagedScope,
+	source: ManagedCandidate,
+	destination: { path: string; sessionId: string; cwd: string },
+	assertPublicationConsent?: () => void,
+): void {
+	assertPublicationConsent?.();
 	const receipt = receiptPathFor(scope, source, "prepared");
-	let record: {
-		sourceArtifactQuarantine?: {
-			path?: unknown;
-			detachedPath?: unknown;
-			identity?: Record<string, unknown>;
-			tree?: unknown;
-		};
-	};
+	let parsedReceipt: ParsedPreparedArtifactReceipt;
 	try {
-		record = JSON.parse(captureManagedFileNoFollow(receipt).bytes.toString("utf8")) as typeof record;
+		parsedReceipt = parsePreparedArtifactReceipt(receipt, scope, source, destination);
 	} catch {
-		if (!fs.existsSync(receipt)) return;
+		try {
+			fs.lstatSync(receipt);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		}
 		throw new Error("durability_failed");
 	}
-	const quarantine = record.sourceArtifactQuarantine;
-	if (!quarantine) return;
-	const identity = quarantine.identity;
-	if (
-		quarantine.path !== source.path.slice(0, -6) ||
-		typeof quarantine.detachedPath !== "string" ||
-		path.dirname(quarantine.detachedPath) !== path.dirname(source.path) ||
-		!path.basename(quarantine.detachedPath).startsWith(".gjc-migrate-") ||
-		!artifactTreeSnapshot(quarantine.tree) ||
-		!identity ||
-		typeof identity.dev !== "string" ||
-		typeof identity.ino !== "string" ||
-		typeof identity.size !== "string" ||
-		typeof identity.mtimeNs !== "string"
-	)
-		throw new Error("durability_failed");
-	const expectedTree = artifactTreeSnapshot(quarantine.tree)!;
-	const assertPreparedTree = (pathname: string): void => {
-		validateManagedArtifactTree(pathname);
-		const observed = native.snapshotDirectoryTree(pathname);
-		if (!observed.ok || !observed.snapshot || JSON.stringify(observed.snapshot) !== JSON.stringify(expectedTree))
-			throw new Error("durability_failed");
-	};
-	if (fs.existsSync(quarantine.path)) {
-		const existing = fs.lstatSync(quarantine.path, { bigint: true });
-		if (
-			existing.isSymbolicLink() ||
-			!existing.isDirectory() ||
-			existing.dev !== BigInt(identity.dev) ||
-			existing.ino !== BigInt(identity.ino) ||
-			existing.size !== BigInt(identity.size) ||
-			existing.mtimeNs !== BigInt(identity.mtimeNs)
-		)
-			throw new Error("durability_failed");
-		assertPreparedTree(quarantine.path);
+	const quarantine = parsedReceipt.sourceArtifactQuarantine;
+	if (!quarantine) {
+		const detachedPath = plannedDetachedArtifactPath(source.path, stableOperationName(source));
+		if (artifactRootExistsNoFollow(detachedPath)) throw new Error("durability_failed");
 		return;
 	}
-	assertPreparedTree(quarantine.detachedPath);
-	const result = native.exactRestore(quarantine.detachedPath, quarantine.path, {
-		dev: BigInt(identity.dev),
-		ino: BigInt(identity.ino),
-		size: BigInt(identity.size),
-		mtimeNs: BigInt(identity.mtimeNs),
+	const prepared = {
+		originalPath: quarantine.path,
+		detachedPath: quarantine.detachedPath,
+		identity: quarantine.identity,
+		tree: quarantine.tree,
+	};
+	const detachedExists = artifactRootExistsNoFollow(prepared.detachedPath);
+	const originalExists = artifactRootExistsNoFollow(prepared.originalPath);
+	if (originalExists && detachedExists) throw new Error("destination_conflict");
+	if (originalExists) {
+		assertPublicationConsent?.();
+		assertRestoredArtifactRoot(prepared.originalPath, prepared);
+		assertPublicationConsent?.();
+		return;
+	}
+	if (!detachedExists) throw new Error("durability_failed");
+	assertPublicationConsent?.();
+	assertDetachedArtifactRoot(prepared.detachedPath, prepared, true);
+	assertPublicationConsent?.();
+	const result = native.exactRestore(prepared.detachedPath, prepared.originalPath, {
+		dev: prepared.identity.dev,
+		ino: prepared.identity.ino,
+		size: prepared.identity.size,
+		mtimeNs: prepared.identity.mtimeNs,
 		directory: true,
 	});
 	if (!result.ok) throw new Error("durability_failed");
+	assertPublicationConsent?.();
+	assertRestoredArtifactRoot(prepared.originalPath, prepared);
+	assertPublicationConsent?.();
 }
 
-function restoreDetachedArtifactRoot(detached: DetachedArtifactRoot): void {
+function restoreDetachedArtifactRoot(detached: DetachedArtifactRoot, assertPublicationConsent?: () => void): void {
+	assertPublicationConsent?.();
 	const result = native.exactRestore(detached.detachedPath, detached.originalPath, {
 		...detached.identity,
 		directory: true,
 	});
 	if (!result.ok) throw new Error("durability_failed");
+	assertRestoredArtifactRoot(detached.originalPath, detached);
+	assertPublicationConsent?.();
 }
 
 async function copyArtifacts(
@@ -1981,6 +2213,7 @@ async function copyArtifacts(
 	lock: ManagedStorageLock,
 	expectedCandidate: ManagedCandidate,
 	expectedIdentity: ResumeSessionIdentity,
+	assertPublicationConsent?: () => void,
 	sourceRootOverride?: string,
 ): Promise<void> {
 	const root = scopeRoot(scope);
@@ -2011,7 +2244,7 @@ async function copyArtifacts(
 			throw new Error("source_changed");
 		try {
 			revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
-			await copyManagedFileNoReplace(source, destination, snapshot, root);
+			await copyManagedFileNoReplace(source, destination, snapshot, assertPublicationConsent, root);
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
 		}
@@ -2026,7 +2259,6 @@ async function copyArtifacts(
 	if (!manifestMatches(sourceTranscript, manifest, sourceRoot) || !manifestMatches(destinationTranscript, manifest))
 		throw new Error("durability_failed");
 }
-
 function migrationReceipt(
 	scope: ManagedScope,
 	lock: ManagedStorageLock,
@@ -2319,6 +2551,7 @@ export async function openManagedCandidateForWrite(
 	const internal = managedInternalDirectory(scope);
 	let lock: ManagedStorageLock | undefined;
 	let detachedArtifacts: DetachedArtifactRoot | undefined;
+	let assertPublicationConsent: (() => void) | undefined;
 	try {
 		revalidatePickerConsent(scope, current, expectedIdentity);
 		lock = await acquireManagedLock(path.join(internal, MANAGED_LOCKS_DIRECTORY), operation, scopeRoot(scope));
@@ -2337,16 +2570,15 @@ export async function openManagedCandidateForWrite(
 			};
 		scopeRoot(scope);
 		revalidatePickerConsent(scope, afterLock, expectedIdentity);
-		restorePreparedArtifactRoot(scope, afterLock);
-		scopeRoot(scope);
-		const sourceSnapshot = captureManagedFileNoFollow(afterLock.path);
-		let manifest: readonly ArtifactManifestEntry[] = [];
-		const artifactPlan = planArtifactRootForMigration(afterLock.path, operation);
-		const intendedDestination = { path: destination, sessionId: afterLock.sessionId, cwd: afterLock.cwd };
-		const assertPublicationConsent = (): void => {
+		assertPublicationConsent = () => {
 			heldLock.assertOwned();
 			revalidatePickerConsent(scope, afterLock, expectedIdentity);
 		};
+		const intendedDestination = { path: destination, sessionId: afterLock.sessionId, cwd: afterLock.cwd };
+		restorePreparedArtifactRoot(scope, afterLock, intendedDestination, assertPublicationConsent);
+		scopeRoot(scope);
+		let manifest: readonly ArtifactManifestEntry[] = [];
+		const artifactPlan = planArtifactRootForMigration(afterLock.path, operation);
 		if (existing && existing.identity.sha256 !== afterLock.identity.sha256) {
 			return {
 				kind: "error",
@@ -2392,10 +2624,13 @@ export async function openManagedCandidateForWrite(
 		lock.assertOwned();
 		if (!preparedReceiptMatches(preparedReceipt, scope, afterLock, intendedDestination, artifactPlan))
 			throw new Error("durability_failed");
-		if (artifactPlan && fs.existsSync(artifactPlan.detachedPath)) throw new Error("destination_conflict");
+		if (artifactPlan && artifactRootExistsNoFollow(artifactPlan.detachedPath))
+			throw new Error("destination_conflict");
 		revalidatePickerConsent(scope, afterLock, expectedIdentity);
 		scopeRoot(scope);
-		detachedArtifacts = artifactPlan ? detachArtifactRootForMigration(artifactPlan) : undefined;
+		detachedArtifacts = artifactPlan
+			? detachArtifactRootForMigration(artifactPlan, assertPublicationConsent)
+			: undefined;
 		manifest = detachedArtifacts ? artifactManifestFromSnapshot(detachedArtifacts.tree) : [];
 		await copyArtifacts(
 			scope,
@@ -2405,13 +2640,23 @@ export async function openManagedCandidateForWrite(
 			lock,
 			afterLock,
 			expectedIdentity,
+			assertPublicationConsent,
 			detachedArtifacts?.detachedPath,
 		);
 		if (!existing) {
 			try {
 				revalidatePickerConsent(scope, afterLock, expectedIdentity);
 				lock.assertOwned();
-				await copyManagedFileNoReplace(afterLock.path, destination, sourceSnapshot, scopeRoot(scope));
+				assertPublicationConsent?.();
+				const sourceSnapshot = captureManagedFileNoFollow(afterLock.path);
+				assertPublicationConsent?.();
+				await copyManagedFileNoReplace(
+					afterLock.path,
+					destination,
+					sourceSnapshot,
+					assertPublicationConsent,
+					scopeRoot(scope),
+				);
 			} catch (error) {
 				if ((error as Error).message !== "destination_conflict") throw error;
 			}
@@ -2432,7 +2677,7 @@ export async function openManagedCandidateForWrite(
 		if (detachedArtifacts) {
 			revalidatePickerConsent(scope, afterLock, expectedIdentity);
 			scopeRoot(scope);
-			restoreDetachedArtifactRoot(detachedArtifacts);
+			restoreDetachedArtifactRoot(detachedArtifacts, assertPublicationConsent);
 			detachedArtifacts = undefined;
 		}
 		const latest = validateCandidateForScope(scope, afterLock);
@@ -2476,8 +2721,17 @@ export async function openManagedCandidateForWrite(
 		};
 	} catch (error) {
 		try {
-			if (detachedArtifacts) restoreDetachedArtifactRoot(detachedArtifacts);
-		} catch {
+			if (detachedArtifacts) restoreDetachedArtifactRoot(detachedArtifacts, assertPublicationConsent);
+		} catch (restoreError) {
+			const restoreCode = expectedFailure(restoreError);
+			if (restoreCode === "migration_busy" || restoreCode === "source_changed") {
+				return {
+					kind: "error",
+					code: restoreCode,
+					message:
+						restoreError instanceof Error ? restoreError.message : "Managed migration recovery lost authority.",
+				};
+			}
 			return {
 				kind: "error",
 				code: "durability_failed",

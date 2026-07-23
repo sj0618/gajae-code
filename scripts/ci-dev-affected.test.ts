@@ -775,6 +775,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
 			"check:@gajae-code/stats",
+			"test:@gajae-code/stats",
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
 			"check:@gajae-code/typescript-edit-benchmark", "test:@gajae-code/typescript-edit-benchmark",
 			"check:@gajae-code/utils", "test:@gajae-code/utils",
@@ -1039,9 +1040,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	test("routes the Windows session-path regression for session I/O sources and its regression test", () => {
 		for (const changedPath of [
 			"packages/coding-agent/src/session/internal/managed-session-scope.ts",
+			"packages/coding-agent/src/session/internal/managed-session-storage.ts",
 			"packages/coding-agent/src/session/blob-store.ts",
 			"packages/coding-agent/src/session/session-manager.ts",
 			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
+			"packages/coding-agent/test/session-manager/session-directory.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Integer CLI flags now reject trailing characters, decimals, exponent notation, surrounding whitespace, and values outside JavaScript's safe-integer range instead of silently truncating or rounding them.
+
 ## [0.11.8] - 2026-07-23
 
 ## [0.11.7] - 2026-07-22
